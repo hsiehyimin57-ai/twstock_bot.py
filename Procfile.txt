@@ -1,1 +1,1 @@
-worker: python twstock_alert_bot.py
+worker: python twstock_alert1124_bot.py
