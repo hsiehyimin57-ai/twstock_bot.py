@@ -7,59 +7,50 @@ TOKEN   = os.environ.get('TELEGRAM_TOKEN', '')
 CHAT_ID = int(os.environ.get('TELEGRAM_CHAT_ID', '0'))
 API     = 'https://api.telegram.org/bot' + TOKEN
 
-# 儲存要追蹤的股票代號
 TRACK_LIST = []
-# 記錄每檔股票當日的狀態
 INTRADAY_STATE = {}
-# 儲存全台股票代號與名稱的對應表
 STOCK_NAMES = {}
 
+# 偽裝成一般使用者的瀏覽器標頭，對抗證交所防火牆
+HEADERS_WEB = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'Referer': 'https://www.twse.com.tw/',
+    'X-Requested-With': 'XMLHttpRequest'
+}
+
 def update_stock_names():
-    """獲取最新的股票名稱對應表"""
     global STOCK_NAMES
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     logging.info("正在更新全台股票名稱清單...")
-    
-    # 優先來源: FinMind (對海外 IP 友善)
     try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo", headers=headers, timeout=10)
+        r = requests.get("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo", headers=HEADERS_WEB, timeout=10)
         if r.status_code == 200:
-            data = r.json().get('data', [])
-            for item in data:
+            for item in r.json().get('data', []):
                 STOCK_NAMES[str(item.get('stock_id', ''))] = item.get('stock_name', '')
             if STOCK_NAMES:
-                logging.info(f"成功從 FinMind 取得 {len(STOCK_NAMES)} 檔股票名稱。")
                 return
     except Exception as e:
-        logging.error(f"FinMind API 取得失敗: {e}")
+        pass
 
-    # 備用來源: 台灣證交所與櫃買中心 Open API
     try:
-        r_twse = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', headers=headers, timeout=10)
+        r_twse = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', headers=HEADERS_WEB, timeout=10)
         if r_twse.status_code == 200:
             for item in r_twse.json():
                 STOCK_NAMES[str(item.get('Code', ''))] = item.get('Name', '')
-                
-        r_tpex = requests.get('https://www.tpex.org.tw/openapi/v1/t187ap03_L', headers=headers, timeout=10)
+        r_tpex = requests.get('https://www.tpex.org.tw/openapi/v1/t187ap03_L', headers=HEADERS_WEB, timeout=10)
         if r_tpex.status_code == 200:
             for item in r_tpex.json():
                 STOCK_NAMES[str(item.get('SecuritiesCompanyCode', ''))] = item.get('CompanyName', '')
-                
-        logging.info("成功從政府 Open API 取得股票名稱。")
     except Exception as e:
-        logging.error(f"政府 Open API 取得失敗: {e}")
+        pass
 
 def send(chat_id, text):
     try:
-        requests.post(API + '/sendMessage',
-            json={'chat_id': chat_id, 'text': text}, timeout=10)
+        requests.post(API + '/sendMessage', json={'chat_id': chat_id, 'text': text}, timeout=10)
     except Exception as e:
         logging.error('Telegram send error: ' + str(e))
 
 def get_stock_data(symbol):
-    """從 Yahoo Finance 抓取當日 1 分鐘 K 線資料"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
     if symbol == '^TWII':
         urls = [f"https://query1.finance.yahoo.com/v8/finance/chart/^TWII?interval=1m&range=1d"]
     else:
@@ -67,63 +58,67 @@ def get_stock_data(symbol):
     
     for url in urls:
         try:
-            r = requests.get(url, headers=headers, timeout=5)
+            r = requests.get(url, headers=HEADERS_WEB, timeout=5)
             if r.status_code == 200:
                 data = r.json()
                 result = data.get('chart', {}).get('result', [])
                 if result and result[0].get('timestamp'):
                     return result[0]
-        except Exception as e:
+        except:
             pass
     return None
 
 def get_last_trading_date():
-    """取得理論上的最近交易日 (略過週末與尚未收盤的時間)"""
     tw_time = datetime.now(timezone(timedelta(hours=8)))
     trade_time = tw_time
     if trade_time.hour < 15:
         trade_time -= timedelta(days=1)
-    while trade_time.weekday() > 4: # 5是週六, 6是週日
+    while trade_time.weekday() > 4: 
         trade_time -= timedelta(days=1)
     return trade_time
 
-def fetch_twse_main_api(url_template, date_obj, max_attempts=7):
-    """自動往前尋找有資料的交易日 (避開國定假日無資料的狀況)"""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+def fetch_twse_rwd_api(url_template, date_obj, max_attempts=5):
+    """使用證交所最新的 RWD API，並附上完整偽裝標頭"""
+    last_error = "未知錯誤"
+    current_date = date_obj
+    
     for _ in range(max_attempts):
-        date_str = date_obj.strftime('%Y%m%d')
+        date_str = current_date.strftime('%Y%m%d')
         url = url_template.format(date_str)
         try:
-            r = requests.get(url, headers=headers, timeout=10)
+            r = requests.get(url, headers=HEADERS_WEB, timeout=15)
             if r.status_code == 200:
                 data = r.json()
-                # 證交所官網API回傳 stat 為 OK 代表當日有交易資料
                 if data.get('stat') == 'OK':
-                    return data, date_obj
+                    return data, current_date, "OK"
+                else:
+                    last_error = f"API狀態: {data.get('stat', '無資料')}"
+            else:
+                last_error = f"HTTP被拒 {r.status_code}"
         except Exception as e:
-            pass
-        # 如果沒資料(假日)，就往前推一天，並略過週末
-        date_obj -= timedelta(days=1)
-        while date_obj.weekday() > 4:
-            date_obj -= timedelta(days=1)
-        time.sleep(1)
-    return None, None
+            last_error = f"連線異常: {str(e)[:20]}"
+
+        current_date -= timedelta(days=1)
+        while current_date.weekday() > 4:
+            current_date -= timedelta(days=1)
+        time.sleep(1.5) # 降低請求頻率
+        
+    return None, None, last_error
 
 def generate_post_market_msg():
-    """生成盤後籌碼彙整報告"""
     msgs = []
     tw_time = datetime.now(timezone(timedelta(hours=8)))
     trade_time = get_last_trading_date()
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
 
     msgs.append(f"📊 【盤後籌碼總結】 查詢時間: {tw_time.strftime('%m-%d %H:%M')}")
     msgs.append("-------------------------")
 
-    # 1. 三大法人買賣超金額 (改用證交所官網 API)
-    try:
-        url_bfi = "https://www.twse.com.tw/fund/BFI82U?response=json&dayDate={}&type=day"
-        data_bfi, actual_date = fetch_twse_main_api(url_bfi, trade_time)
-        if data_bfi:
+    # 1. 三大法人買賣超金額 (改用 RWD API)
+    url_bfi = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?date={}&response=json"
+    data_bfi, actual_date, err_bfi = fetch_twse_rwd_api(url_bfi, trade_time)
+    
+    if data_bfi:
+        try:
             f_net, i_net, d_net = 0.0, 0.0, 0.0
             idx_name = data_bfi['fields'].index('單位名稱')
             idx_diff = data_bfi['fields'].index('買賣差額')
@@ -142,26 +137,24 @@ def generate_post_market_msg():
             msgs.append(f"   外資: {f_net/1e8:+.2f} 億")
             msgs.append(f"   投信: {i_net/1e8:+.2f} 億")
             msgs.append(f"   自營商: {d_net/1e8:+.2f} 億")
-            
-            # 將確認有開市的日期同步給後面的查詢使用
             trade_time = actual_date 
-        else:
-            msgs.append("💰 三大法人買賣超: 無法取得近日資料")
-    except Exception as e:
-        msgs.append("⚠️ 三大法人金額: 抓取發生錯誤")
+        except Exception as e:
+            msgs.append(f"⚠️ 三大法人金額: 解析錯誤")
+    else:
+        msgs.append(f"⚠️ 三大法人金額: 失敗 ({err_bfi})")
 
     msgs.append("-------------------------")
 
-    # 2. 外資期貨未平倉 (FinMind，往前抓取15天確保週末也能比對)
+    # 2. 外資期貨未平倉 (天數拉長為30天)
     try:
-        start_date = (tw_time - timedelta(days=15)).strftime('%Y-%m-%d')
+        start_date = (tw_time - timedelta(days=30)).strftime('%Y-%m-%d')
         fm_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id=TX&start_date={start_date}"
-        r = requests.get(fm_url, headers=headers, timeout=10)
+        r = requests.get(fm_url, headers=HEADERS_WEB, timeout=10)
         if r.status_code == 200:
             data = r.json().get('data', [])
             fi_data = [d for d in data if '外資' in d.get('name', '') and d.get('data_id') == 'TX']
             if len(fi_data) >= 2:
-                fi_data.sort(key=lambda x: x['date']) # 確保日期排序
+                fi_data.sort(key=lambda x: x['date']) 
                 recent_date = fi_data[-1].get('date', '')
                 today_oi = fi_data[-1].get('long_short_oi_net_volume', 0)
                 yest_oi = fi_data[-2].get('long_short_oi_net_volume', 0)
@@ -169,23 +162,23 @@ def generate_post_market_msg():
                 msgs.append(f"📈 外資台指淨未平倉 ({recent_date}):")
                 msgs.append(f"   {today_oi:,} 口 (較前日 {diff:+,} 口)")
             else:
-                msgs.append("📈 外資台指淨未平倉: 尚無完整資料")
+                msgs.append("📈 外資台指淨未平倉: 近30日無足夠資料")
         else:
-            msgs.append("⚠️ 期貨未平倉: API連線失敗")
+            msgs.append(f"⚠️ 期貨未平倉: 連線失敗 ({r.status_code})")
     except Exception as e:
         msgs.append("⚠️ 期貨未平倉: 抓取發生錯誤")
 
     msgs.append("-------------------------")
 
-    # 3. 三大法人買賣超前20名 (改用證交所官網 API)
-    try:
-        url_t86 = "https://www.twse.com.tw/fund/T86?response=json&date={}&selectType=ALL"
-        data_t86, _ = fetch_twse_main_api(url_t86, trade_time)
-        if data_t86:
+    # 3. 三大法人買賣超前20名 (改用 RWD API)
+    url_t86 = "https://www.twse.com.tw/rwd/zh/fund/T86?date={}&selectType=ALL&response=json"
+    data_t86, _, err_t86 = fetch_twse_rwd_api(url_t86, trade_time)
+    
+    if data_t86:
+        try:
             idx_code = data_t86['fields'].index('證券代號')
             idx_name = data_t86['fields'].index('證券名稱')
             
-            # 尋找「三大法人買賣超股數」的索引 (避免官方改欄位名稱)
             idx_diff = -1
             for i, field in enumerate(data_t86['fields']):
                 if '三大法人買賣超股數' in field:
@@ -204,7 +197,6 @@ def generate_post_market_msg():
                     except:
                         pass
                 
-                # 排序出買超與賣超前 20 名
                 sorted_data = sorted(parsed_data, key=lambda x: x['Diff_int'], reverse=True)
                 top_buy = sorted_data[:20]
                 top_sell = sorted_data[-20:]
@@ -216,9 +208,8 @@ def generate_post_market_msg():
                         sym = item.get('Code', '')
                         name = item.get('Name', '').strip()
                         shares = item.get('Diff_int', 0)
-                        lots = abs(shares) // 1000 # 換算成張數
+                        lots = abs(shares) // 1000 
 
-                        # 順便查現價
                         price_info = "無報價"
                         s_data = get_stock_data(sym)
                         if s_data and s_data.get('indicators', {}).get('quote', []):
@@ -238,7 +229,7 @@ def generate_post_market_msg():
                                     
                         action = "買" if is_buy else "賣"
                         lines.append(f"{idx+1}. {sym} {name}: {price_info} | {action} {lots:,} 張")
-                        time.sleep(0.05) # 稍微喘息，避免被 Yahoo 封鎖
+                        time.sleep(0.05) 
                     return lines
 
                 msgs.append("🔥 【法人買超前 20 名】")
@@ -248,18 +239,16 @@ def generate_post_market_msg():
                 msgs.extend(format_stock_list(top_sell, False))
             else:
                 msgs.append("⚠️ 買賣超排行: 找不到官方資料對應欄位")
-        else:
-            msgs.append("⚠️ 買賣超排行: 無法取得近日資料")
-    except Exception as e:
-        msgs.append("⚠️ 買賣超排行: 抓取發生錯誤")
+        except Exception as e:
+            msgs.append(f"⚠️ 買賣超排行: 解析錯誤")
+    else:
+        msgs.append(f"⚠️ 買賣超排行: 失敗 ({err_t86})")
 
     return "\n".join(msgs)
 
 def post_market_job(chat_id):
-    """處理盤後報告推播 (以執行緒執行避免卡住)"""
     send(chat_id, "⏳ 正在彙整盤後籌碼與個股現價，約需20~30秒，請稍候...")
     msg = generate_post_market_msg()
-    # 避免超過 Telegram 單則訊息上限，若過長則分段傳送
     if len(msg) > 4000:
         send(chat_id, msg[:4000])
         send(chat_id, msg[4000:])
@@ -445,9 +434,7 @@ def polling_loop():
     logging.info('Telegram Polling started')
     while True:
         try:
-            r = requests.get(API + '/getUpdates',
-                params={'offset': offset, 'timeout': 30},
-                timeout=35)
+            r = requests.get(API + '/getUpdates', params={'offset': offset, 'timeout': 30}, timeout=35)
             updates = r.json().get('result', [])
             for u in updates:
                 offset = u['update_id'] + 1
@@ -465,13 +452,11 @@ def market_monitor_loop():
         if time_str == '08:30' and tw_time.second == 0:
             INTRADAY_STATE.clear()
             update_stock_names()
-            logging.info("Intraday state cleared and stock names updated.")
             time.sleep(1)
             
         if time_str == '16:30' and tw_time.second == 0:
             is_weekday = tw_time.weekday() < 5
             if is_weekday:
-                logging.info("Triggering scheduled post market report...")
                 threading.Thread(target=post_market_job, args=(CHAT_ID,), daemon=True).start()
             time.sleep(1)
             
@@ -489,7 +474,6 @@ def market_monitor_loop():
 if __name__ == '__main__':
     logging.info('twstock_alert1124_bot started!')
     update_stock_names()
-    
     t = threading.Thread(target=market_monitor_loop, daemon=True)
     t.start()
     polling_loop()
