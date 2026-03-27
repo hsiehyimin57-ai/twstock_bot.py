@@ -22,13 +22,17 @@ def send(chat_id, text):
 def get_stock_data(symbol):
     """
     從 Yahoo Finance 抓取當日 1 分鐘 K 線資料
-    自動嘗試 .TW (上市) 與 .TWO (上櫃)
+    自動嘗試 .TW (上市) 與 .TWO (上櫃)，並特別處理加權指數 ^TWII
     """
-    suffixes = ['.TW', '.TWO']
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
     
-    for suffix in suffixes:
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{suffix}?interval=1m&range=1d"
+    # 判斷是否為大盤加權指數
+    if symbol == '^TWII':
+        urls = [f"https://query1.finance.yahoo.com/v8/finance/chart/^TWII?interval=1m&range=1d"]
+    else:
+        urls = [f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{suffix}?interval=1m&range=1d" for suffix in ['.TW', '.TWO']]
+    
+    for url in urls:
         try:
             r = requests.get(url, headers=headers, timeout=5)
             if r.status_code == 200:
@@ -80,7 +84,7 @@ def analyze_and_alert(symbol, tw_time):
 
     # 1. 09:00 開盤價推播
     if current_time_str >= '09:00' and not state['reported_open']:
-        alerts.append(f"🎯 【開盤】{symbol} 開盤價: {state['open_price']}")
+        alerts.append(f"🎯 【開盤】{symbol} 開盤價: {state['open_price']:.2f}")
         state['reported_open'] = True
         state['day_high'] = highs[0] if highs[0] else current_price
         state['max_vol'] = volumes[0] if volumes[0] else 0
@@ -99,28 +103,28 @@ def analyze_and_alert(symbol, tw_time):
                     max_v_price = closes[i]
         
         if max_v > 0:
-            alerts.append(f"📊 【09:20 結算】{symbol} 早盤最大量價格: {max_v_price} (單分鐘量: {max_v})")
+            alerts.append(f"📊 【09:20 結算】{symbol} 早盤最大量價格: {max_v_price:.2f} (單分鐘量: {max_v})")
         state['reported_0920'] = True
 
     # 3. 每 30 分鐘定期推播 (09:30, 10:00, 10:30 ... 13:00)
     if current_minute in [0, 30] and '09:30' <= current_time_str <= '13:00':
         if state['last_30m_report'] != current_time_str:
-            alerts.append(f"⏱ 【定時回報】{symbol} 目前股價: {current_price}")
+            alerts.append(f"⏱ 【定時回報】{symbol} 目前股價: {current_price:.2f}")
             state['last_30m_report'] = current_time_str
 
     # 4. 盤中創新高價
     if current_price > state['day_high'] and current_time_str > '09:00':
-        alerts.append(f"🔥 【創新高】{symbol} 突破本日新高價: {current_price}")
+        alerts.append(f"🔥 【創新高】{symbol} 突破本日新高價: {current_price:.2f}")
         state['day_high'] = current_price
 
     # 5. 盤中創新爆量 (單分鐘成交量大於今日最高單分鐘量，排除開盤量)
     if current_vol > state['max_vol'] and current_time_str > '09:00':
-        alerts.append(f"💥 【爆大量】{symbol} 出現單分鐘新天量: {current_vol} 張，股價: {current_price}")
+        alerts.append(f"💥 【爆大量】{symbol} 出現單分鐘新天量: {current_vol} 張，股價: {current_price:.2f}")
         state['max_vol'] = current_vol
 
     # 6. 13:30 收盤價
     if current_time_str >= '13:30' and not state['reported_close']:
-        alerts.append(f"🏁 【收盤】{symbol} 收盤價: {current_price}")
+        alerts.append(f"🏁 【收盤】{symbol} 收盤價: {current_price:.2f}")
         state['reported_close'] = True
 
     # 如果有任何警報，發送推播
@@ -163,7 +167,6 @@ def handle(update):
         parts = text.strip().split()
         symbols_to_check = []
         
-        # 如果後面有加代號，就查指定的代號；如果沒有，就查追蹤清單
         if len(parts) > 1:
             symbols_to_check = parts[1:]
         else:
@@ -177,15 +180,38 @@ def handle(update):
         tw_time = datetime.now(timezone(timedelta(hours=8)))
         time_str = tw_time.strftime('%H:%M')
         
+        # --- 1. 優先抓取大盤加權指數 ---
+        twii_data = get_stock_data('^TWII')
+        if twii_data and twii_data.get('indicators', {}).get('quote', []):
+            meta = twii_data.get('meta', {})
+            prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
+            closes = twii_data['indicators']['quote'][0].get('close', [])
+            valid_closes = [c for c in closes if c is not None]
+            
+            if valid_closes and prev_close:
+                curr = valid_closes[-1]
+                chg = curr - prev_close
+                pct = (chg / prev_close) * 100
+                alerts.append(f"📈 加權指數: {curr:.2f} ({chg:+.2f}, {pct:+.2f}%)")
+                alerts.append("-------------------------")
+        
+        # --- 2. 抓取個股資料 ---
         for sym in symbols_to_check:
             data = get_stock_data(sym)
             if data and data.get('indicators', {}).get('quote', []):
+                meta = data.get('meta', {})
+                prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
                 closes = data['indicators']['quote'][0].get('close', [])
-                # 過濾掉尚未產生的 None 值
                 valid_closes = [c for c in closes if c is not None]
+                
                 if valid_closes:
                     current_price = valid_closes[-1]
-                    alerts.append(f"📌 {sym}: {current_price}")
+                    if prev_close:
+                        chg = current_price - prev_close
+                        pct = (chg / prev_close) * 100
+                        alerts.append(f"📌 {sym}: {current_price:.2f} ({chg:+.2f}, {pct:+.2f}%)")
+                    else:
+                        alerts.append(f"📌 {sym}: {current_price:.2f}")
                 else:
                     alerts.append(f"⚠️ {sym}: 暫無今日報價資料")
             else:
