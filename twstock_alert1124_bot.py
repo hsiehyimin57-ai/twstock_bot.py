@@ -20,7 +20,7 @@ def update_stock_names():
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     logging.info("正在更新全台股票名稱清單...")
     
-    # 優先來源: FinMind (對海外雲端 IP 較友善)
+    # 優先來源: FinMind
     try:
         r = requests.get("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo", headers=headers, timeout=10)
         if r.status_code == 200:
@@ -74,8 +74,139 @@ def get_stock_data(symbol):
                 if result and result[0].get('timestamp'):
                     return result[0]
         except Exception as e:
-            logging.error(f"Error fetching {symbol}: {e}")
+            pass
     return None
+
+def generate_post_market_msg():
+    """生成盤後籌碼彙整報告"""
+    msgs = []
+    tw_time = datetime.now(timezone(timedelta(hours=8)))
+    date_str = tw_time.strftime('%Y-%m-%d')
+    msgs.append(f"📊 【盤後籌碼總結】 {date_str}")
+    msgs.append("-------------------------")
+
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+
+    # 1. 三大法人買賣超金額
+    try:
+        r = requests.get('https://openapi.twse.com.tw/v1/fund/BFI82U', headers=headers, timeout=10)
+        if r.status_code == 200 and r.json():
+            data = r.json()
+            f_net, i_net, d_net = 0.0, 0.0, 0.0
+            for item in data:
+                amt = float(item.get('DifferenceAmount', '0').replace(',', ''))
+                name = item.get('Item', '')
+                if '外資' in name:
+                    f_net += amt
+                elif '投信' in name:
+                    i_net += amt
+                elif '自營' in name:
+                    d_net += amt
+            total_net = f_net + i_net + d_net
+            msgs.append(f"💰 三大法人買賣超: {total_net/1e8:+.2f} 億")
+            msgs.append(f"   外資: {f_net/1e8:+.2f} 億")
+            msgs.append(f"   投信: {i_net/1e8:+.2f} 億")
+            msgs.append(f"   自營商: {d_net/1e8:+.2f} 億")
+        else:
+            msgs.append("💰 三大法人買賣超: 尚無資料")
+    except Exception as e:
+        msgs.append("⚠️ 三大法人金額: 抓取失敗")
+
+    msgs.append("-------------------------")
+
+    # 2. 外資期貨未平倉 (使用 FinMind)
+    try:
+        start_date = (tw_time - timedelta(days=10)).strftime('%Y-%m-%d')
+        fm_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id=TX&start_date={start_date}"
+        r = requests.get(fm_url, headers=headers, timeout=10)
+        if r.status_code == 200:
+            data = r.json().get('data', [])
+            fi_data = [d for d in data if '外資' in d.get('name', '')]
+            if len(fi_data) >= 2:
+                recent_date = fi_data[-1].get('date', '')
+                today_oi = fi_data[-1].get('long_short_oi_net_volume', 0)
+                yest_oi = fi_data[-2].get('long_short_oi_net_volume', 0)
+                diff = today_oi - yest_oi
+                msgs.append(f"📈 外資台指淨未平倉 ({recent_date}):")
+                msgs.append(f"   {today_oi:,} 口 (較前日 {diff:+,} 口)")
+            else:
+                msgs.append("📈 外資台指淨未平倉: 尚無完整資料")
+        else:
+            msgs.append("⚠️ 期貨未平倉: 抓取失敗")
+    except Exception as e:
+        msgs.append("⚠️ 期貨未平倉: 抓取失敗")
+
+    msgs.append("-------------------------")
+
+    # 3. 三大法人買賣超前20名
+    try:
+        r = requests.get('https://openapi.twse.com.tw/v1/fund/T86', headers=headers, timeout=15)
+        if r.status_code == 200 and r.json():
+            data = r.json()
+            for d in data:
+                try:
+                    d['Diff_int'] = int(d.get('Difference', '0').replace(',', ''))
+                except:
+                    d['Diff_int'] = 0
+            
+            sorted_data = sorted(data, key=lambda x: x['Diff_int'], reverse=True)
+            top_buy = sorted_data[:20]
+            top_sell = sorted_data[-20:]
+            top_sell.reverse() # 讓賣最多排在最前面
+
+            def format_stock_list(stock_list, is_buy):
+                lines = []
+                for idx, item in enumerate(stock_list):
+                    sym = item.get('Code', '')
+                    name = item.get('Name', '').strip()
+                    shares = item.get('Diff_int', 0)
+                    lots = abs(shares) // 1000 # 換算成「張」
+
+                    # 抓取現價與漲跌幅
+                    price_info = "無報價"
+                    s_data = get_stock_data(sym)
+                    if s_data and s_data.get('indicators', {}).get('quote', []):
+                        meta = s_data.get('meta', {})
+                        prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
+                        closes = s_data['indicators']['quote'][0].get('close', [])
+                        valid_closes = [c for c in closes if c is not None]
+                        
+                        if valid_closes:
+                            curr = valid_closes[-1]
+                            if prev_close:
+                                chg = curr - prev_close
+                                pct = (chg / prev_close) * 100
+                                price_info = f"{curr:.2f} ({chg:+.2f}, {pct:+.2f}%)"
+                            else:
+                                price_info = f"{curr:.2f}"
+                                
+                    action = "買" if is_buy else "賣"
+                    lines.append(f"{idx+1}. {sym} {name}: {price_info} | {action} {lots:,} 張")
+                    time.sleep(0.1) # 稍微暫停避免被 Yahoo 封鎖
+                return lines
+
+            msgs.append("🔥 【法人買超前 20 名】")
+            msgs.extend(format_stock_list(top_buy, True))
+            msgs.append("-------------------------")
+            msgs.append("🩸 【法人賣超前 20 名】")
+            msgs.extend(format_stock_list(top_sell, False))
+        else:
+            msgs.append("⚠️ 買賣超排行: 今日證交所尚未公布資料")
+    except Exception as e:
+        msgs.append("⚠️ 買賣超排行: 抓取發生例外錯誤")
+
+    return "\n".join(msgs)
+
+def post_market_job(chat_id):
+    """處理盤後報告推播 (以執行緒執行避免卡住)"""
+    send(chat_id, "⏳ 正在彙整盤後籌碼與個股現價，約需20~30秒，請稍候...")
+    msg = generate_post_market_msg()
+    # 避免超過 Telegram 單則訊息上限，若過長則分段傳送
+    if len(msg) > 4000:
+        send(chat_id, msg[:4000])
+        send(chat_id, msg[4000:])
+    else:
+        send(chat_id, msg)
 
 def analyze_and_alert(symbol, tw_time):
     """分析單檔股票並判斷是否需要推播"""
@@ -83,7 +214,6 @@ def analyze_and_alert(symbol, tw_time):
     if not data:
         return
 
-    # 確保有名字庫，若無則即時抓取
     if not STOCK_NAMES:
         update_stock_names()
 
@@ -190,8 +320,11 @@ def handle(update):
         INTRADAY_STATE.clear()
         send(chat_id, "🗑 追蹤清單已清空。")
 
+    elif text.startswith('/postmarket'):
+        # 手動查詢盤後報告
+        threading.Thread(target=post_market_job, args=(chat_id,), daemon=True).start()
+
     elif text.startswith('/price'):
-        # 如果名字庫是空的，立刻補抓一次
         if not STOCK_NAMES:
             update_stock_names()
             
@@ -211,7 +344,6 @@ def handle(update):
         tw_time = datetime.now(timezone(timedelta(hours=8)))
         time_str = tw_time.strftime('%H:%M')
         
-        # --- 1. 抓取大盤加權指數 ---
         twii_data = get_stock_data('^TWII')
         if twii_data and twii_data.get('indicators', {}).get('quote', []):
             meta = twii_data.get('meta', {})
@@ -226,7 +358,6 @@ def handle(update):
                 alerts.append(f"📈 加權指數: {curr:.2f} ({chg:+.2f}, {pct:+.2f}%)")
                 alerts.append("-------------------------")
         
-        # --- 2. 抓取個股資料 ---
         for sym in symbols_to_check:
             name = STOCK_NAMES.get(sym, '')
             disp_sym = f"{sym} {name}".strip()
@@ -277,10 +408,19 @@ def market_monitor_loop():
         tw_time = datetime.now(timezone(timedelta(hours=8)))
         time_str = tw_time.strftime('%H:%M')
         
+        # 早上 08:30 重置
         if time_str == '08:30' and tw_time.second == 0:
             INTRADAY_STATE.clear()
             update_stock_names()
             logging.info("Intraday state cleared and stock names updated.")
+            time.sleep(1)
+            
+        # 下午 16:30 自動推播盤後籌碼報告
+        if time_str == '16:30' and tw_time.second == 0:
+            is_weekday = tw_time.weekday() < 5
+            if is_weekday:
+                logging.info("Triggering scheduled post market report...")
+                threading.Thread(target=post_market_job, args=(CHAT_ID,), daemon=True).start()
             time.sleep(1)
             
         is_trading_hours = '09:00' <= time_str <= '13:35'
@@ -296,7 +436,6 @@ def market_monitor_loop():
 
 if __name__ == '__main__':
     logging.info('twstock_alert1124_bot started!')
-    # 程式剛啟動時，先抓取一次全台股票名稱
     update_stock_names()
     
     t = threading.Thread(target=market_monitor_loop, daemon=True)
