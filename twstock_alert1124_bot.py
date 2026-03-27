@@ -11,6 +11,29 @@ API     = 'https://api.telegram.org/bot' + TOKEN
 TRACK_LIST = []
 # 記錄每檔股票當日的狀態 (最高價、最大量、已觸發的推播等)
 INTRADAY_STATE = {}
+# 儲存全台股票代號與名稱的對應表
+STOCK_NAMES = {}
+
+def update_stock_names():
+    """從證交所與櫃買中心 Open API 獲取最新的股票名稱對應表"""
+    global STOCK_NAMES
+    try:
+        logging.info("正在更新全台股票名稱清單...")
+        # 上市 (TWSE)
+        r_twse = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', timeout=10)
+        if r_twse.status_code == 200:
+            for item in r_twse.json():
+                STOCK_NAMES[item.get('Code', '')] = item.get('Name', '')
+                
+        # 上櫃 (TPEx)
+        r_tpex = requests.get('https://www.tpex.org.tw/openapi/v1/t187ap03_L', timeout=10)
+        if r_tpex.status_code == 200:
+            for item in r_tpex.json():
+                STOCK_NAMES[item.get('SecuritiesCompanyCode', '')] = item.get('CompanyName', '')
+                
+        logging.info(f"股票名稱更新完成，共載入 {len(STOCK_NAMES)} 檔標的。")
+    except Exception as e:
+        logging.error(f"更新股票名稱失敗: {e}")
 
 def send(chat_id, text):
     try:
@@ -50,6 +73,10 @@ def analyze_and_alert(symbol, tw_time):
     if not data:
         return
 
+    # 取得股名
+    name = STOCK_NAMES.get(symbol, '')
+    disp_sym = f"{symbol} {name}".strip()
+
     # 解析 Yahoo Finance 資料結構
     timestamps = data['timestamp']
     indicators = data['indicators']['quote'][0]
@@ -84,7 +111,7 @@ def analyze_and_alert(symbol, tw_time):
 
     # 1. 09:00 開盤價推播
     if current_time_str >= '09:00' and not state['reported_open']:
-        alerts.append(f"🎯 【開盤】{symbol} 開盤價: {state['open_price']:.2f}")
+        alerts.append(f"🎯 【開盤】{disp_sym} 開盤價: {state['open_price']:.2f}")
         state['reported_open'] = True
         state['day_high'] = highs[0] if highs[0] else current_price
         state['max_vol'] = volumes[0] if volumes[0] else 0
@@ -103,28 +130,28 @@ def analyze_and_alert(symbol, tw_time):
                     max_v_price = closes[i]
         
         if max_v > 0:
-            alerts.append(f"📊 【09:20 結算】{symbol} 早盤最大量價格: {max_v_price:.2f} (單分鐘量: {max_v})")
+            alerts.append(f"📊 【09:20 結算】{disp_sym} 早盤最大量價格: {max_v_price:.2f} (單分鐘量: {max_v})")
         state['reported_0920'] = True
 
     # 3. 每 30 分鐘定期推播 (09:30, 10:00, 10:30 ... 13:00)
     if current_minute in [0, 30] and '09:30' <= current_time_str <= '13:00':
         if state['last_30m_report'] != current_time_str:
-            alerts.append(f"⏱ 【定時回報】{symbol} 目前股價: {current_price:.2f}")
+            alerts.append(f"⏱ 【定時回報】{disp_sym} 目前股價: {current_price:.2f}")
             state['last_30m_report'] = current_time_str
 
     # 4. 盤中創新高價
     if current_price > state['day_high'] and current_time_str > '09:00':
-        alerts.append(f"🔥 【創新高】{symbol} 突破本日新高價: {current_price:.2f}")
+        alerts.append(f"🔥 【創新高】{disp_sym} 突破本日新高價: {current_price:.2f}")
         state['day_high'] = current_price
 
     # 5. 盤中創新爆量 (單分鐘成交量大於今日最高單分鐘量，排除開盤量)
     if current_vol > state['max_vol'] and current_time_str > '09:00':
-        alerts.append(f"💥 【爆大量】{symbol} 出現單分鐘新天量: {current_vol} 張，股價: {current_price:.2f}")
+        alerts.append(f"💥 【爆大量】{disp_sym} 出現單分鐘新天量: {current_vol} 張，股價: {current_price:.2f}")
         state['max_vol'] = current_vol
 
     # 6. 13:30 收盤價
     if current_time_str >= '13:30' and not state['reported_close']:
-        alerts.append(f"🏁 【收盤】{symbol} 收盤價: {current_price:.2f}")
+        alerts.append(f"🏁 【收盤】{disp_sym} 收盤價: {current_price:.2f}")
         state['reported_close'] = True
 
     # 如果有任何警報，發送推播
@@ -197,6 +224,10 @@ def handle(update):
         
         # --- 2. 抓取個股資料 ---
         for sym in symbols_to_check:
+            # 取得股名
+            name = STOCK_NAMES.get(sym, '')
+            disp_sym = f"{sym} {name}".strip()
+            
             data = get_stock_data(sym)
             if data and data.get('indicators', {}).get('quote', []):
                 meta = data.get('meta', {})
@@ -209,13 +240,13 @@ def handle(update):
                     if prev_close:
                         chg = current_price - prev_close
                         pct = (chg / prev_close) * 100
-                        alerts.append(f"📌 {sym}: {current_price:.2f} ({chg:+.2f}, {pct:+.2f}%)")
+                        alerts.append(f"📌 {disp_sym}: {current_price:.2f} ({chg:+.2f}, {pct:+.2f}%)")
                     else:
-                        alerts.append(f"📌 {sym}: {current_price:.2f}")
+                        alerts.append(f"📌 {disp_sym}: {current_price:.2f}")
                 else:
-                    alerts.append(f"⚠️ {sym}: 暫無今日報價資料")
+                    alerts.append(f"⚠️ {disp_sym}: 暫無今日報價資料")
             else:
-                alerts.append(f"❌ {sym}: 查詢失敗 (請確認代號正確)")
+                alerts.append(f"❌ {disp_sym}: 查詢失敗 (請確認代號正確)")
                 
         if alerts:
             msg_text = f"[{time_str} 即時報價]\n" + "\n".join(alerts)
@@ -243,10 +274,11 @@ def market_monitor_loop():
         tw_time = datetime.now(timezone(timedelta(hours=8)))
         time_str = tw_time.strftime('%H:%M')
         
-        # 每天早上 08:30 自動清空昨天的盤中紀錄狀態，準備迎接新的一天
+        # 每天早上 08:30 自動清空昨天的盤中紀錄狀態，並更新一次最新股名
         if time_str == '08:30' and tw_time.second == 0:
             INTRADAY_STATE.clear()
-            logging.info("Intraday state cleared for the new day.")
+            update_stock_names()
+            logging.info("Intraday state cleared and stock names updated for the new day.")
             time.sleep(1)
             
         # 判斷是否為交易時間 (09:00 ~ 13:35) 且為平日
@@ -265,6 +297,10 @@ def market_monitor_loop():
 
 if __name__ == '__main__':
     logging.info('twstock_alert1124_bot started!')
+    
+    # 程式剛啟動時，先抓取一次全台股票名稱
+    update_stock_names()
+    
     t = threading.Thread(target=market_monitor_loop, daemon=True)
     t.start()
     polling_loop()
