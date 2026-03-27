@@ -158,6 +158,43 @@ def handle(update):
         INTRADAY_STATE.clear()
         send(chat_id, "🗑 追蹤清單已清空。")
 
+    # 新增指令：主動查詢即時股價 (例如: /price 或 /price 2330)
+    elif text.startswith('/price'):
+        parts = text.strip().split()
+        symbols_to_check = []
+        
+        # 如果後面有加代號，就查指定的代號；如果沒有，就查追蹤清單
+        if len(parts) > 1:
+            symbols_to_check = parts[1:]
+        else:
+            if not TRACK_LIST:
+                send(chat_id, "目前沒有追蹤清單。請使用 /track 新增，或輸入 /price [代號] 查詢。")
+                return
+            symbols_to_check = TRACK_LIST
+            
+        send(chat_id, "🔍 正在查詢即時股價，請稍候...")
+        alerts = []
+        tw_time = datetime.now(timezone(timedelta(hours=8)))
+        time_str = tw_time.strftime('%H:%M')
+        
+        for sym in symbols_to_check:
+            data = get_stock_data(sym)
+            if data and data.get('indicators', {}).get('quote', []):
+                closes = data['indicators']['quote'][0].get('close', [])
+                # 過濾掉尚未產生的 None 值
+                valid_closes = [c for c in closes if c is not None]
+                if valid_closes:
+                    current_price = valid_closes[-1]
+                    alerts.append(f"📌 {sym}: {current_price}")
+                else:
+                    alerts.append(f"⚠️ {sym}: 暫無今日報價資料")
+            else:
+                alerts.append(f"❌ {sym}: 查詢失敗 (請確認代號正確)")
+                
+        if alerts:
+            msg_text = f"[{time_str} 即時報價]\n" + "\n".join(alerts)
+            send(chat_id, msg_text)
+
 def polling_loop():
     offset = 0
     logging.info('Telegram Polling started')
