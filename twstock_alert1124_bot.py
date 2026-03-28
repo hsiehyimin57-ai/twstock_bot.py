@@ -3,10 +3,10 @@ from datetime import datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN         = os.environ.get('TELEGRAM_TOKEN', '')
-CHAT_ID       = int(os.environ.get('TELEGRAM_CHAT_ID', '0'))
-FINMIND_TOKEN = os.environ.get('FINMIND_TOKEN', '')   # finmindtrade.com 登入後取得
-API           = 'https://api.telegram.org/bot' + TOKEN
+TOKEN     = os.environ.get('TELEGRAM_TOKEN', '')
+CHAT_ID   = int(os.environ.get('TELEGRAM_CHAT_ID', '0'))
+PROXY_URL = os.environ.get('PROXY_URL', '')   # Cloudflare Worker URL
+API       = 'https://api.telegram.org/bot' + TOKEN
 
 TRACK_LIST     = []
 INTRADAY_STATE = {}
@@ -19,9 +19,21 @@ HEADERS_WEB = {
     'X-Requested-With': 'XMLHttpRequest'
 }
 
-def finmind_headers():
-    """FinMind 需要 Bearer token 放在 Authorization header，不是 query string"""
-    return {**HEADERS_WEB, 'Authorization': f'Bearer {FINMIND_TOKEN}'}
+# ────────────────────────────────────────────────
+# Proxy 請求（TWSE RWD API 須走 Cloudflare Worker）
+# ────────────────────────────────────────────────
+def proxy_get(target_url, timeout=15):
+    """
+    若設定了 PROXY_URL，透過 Cloudflare Worker 發送請求（繞過 TWSE IP 封鎖）。
+    否則直連（本機測試用）。
+    """
+    if PROXY_URL:
+        return requests.get(
+            PROXY_URL,
+            params={'url': target_url},
+            timeout=timeout
+        )
+    return requests.get(target_url, headers=HEADERS_WEB, timeout=timeout)
 
 # ────────────────────────────────────────────────
 # 股票名稱快取
@@ -31,92 +43,86 @@ def update_stock_names():
     logging.info("正在更新全台股票名稱清單...")
     try:
         r = requests.get(
-            'https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo',
-            headers=finmind_headers(), timeout=10
-        )
-        if r.status_code == 200:
-            for item in r.json().get('data', []):
-                STOCK_NAMES[str(item.get('stock_id', ''))] = item.get('stock_name', '')
-            if STOCK_NAMES:
-                return
-    except Exception:
-        pass
-
-    try:
-        r1 = requests.get(
             'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',
             headers=HEADERS_WEB, timeout=10
         )
-        if r1.status_code == 200:
-            for item in r1.json():
+        if r.status_code == 200:
+            for item in r.json():
                 STOCK_NAMES[str(item.get('Code', ''))] = item.get('Name', '')
-        r2 = requests.get(
+    except Exception:
+        pass
+    try:
+        r = requests.get(
             'https://www.tpex.org.tw/openapi/v1/t187ap03_L',
             headers=HEADERS_WEB, timeout=10
         )
-        if r2.status_code == 200:
-            for item in r2.json():
+        if r.status_code == 200:
+            for item in r.json():
                 STOCK_NAMES[str(item.get('SecuritiesCompanyCode', ''))] = item.get('CompanyName', '')
     except Exception:
         pass
 
 # ────────────────────────────────────────────────
-# 全市場收盤價（TWSE + TPEx OpenAPI，Railway 可連）
+# 全市場收盤價（OpenAPI，Railway 可直連）
 # ────────────────────────────────────────────────
 def fetch_bulk_closing_prices():
     prices = {}
     try:
-        r1 = requests.get(
+        r = requests.get(
             'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',
             headers=HEADERS_WEB, timeout=10
         )
-        if r1.status_code == 200:
-            for item in r1.json():
+        if r.status_code == 200:
+            for item in r.json():
                 prices[item.get('Code', '')] = item.get('ClosingPrice', '')
     except Exception:
         pass
     try:
-        r2 = requests.get(
+        r = requests.get(
             'https://www.tpex.org.tw/openapi/v1/t187ap03_L',
             headers=HEADERS_WEB, timeout=10
         )
-        if r2.status_code == 200:
-            for item in r2.json():
+        if r.status_code == 200:
+            for item in r.json():
                 prices[item.get('SecuritiesCompanyCode', '')] = item.get('ClosingPrice', '')
     except Exception:
         pass
     return prices
 
 # ────────────────────────────────────────────────
-# FinMind：個股三大法人（Bearer header 認證）
+# TWSE RWD API（透過 proxy）
 # ────────────────────────────────────────────────
-def fetch_finmind_institutional(trade_date_str):
+def fetch_twse_rwd(url_template, date_obj, max_attempts=5):
     """
-    回傳 (data_list, "OK") 或 (None, 錯誤訊息)
-    欄位：date, stock_id, name (外資/投信/自營), buy, sell
+    嘗試從指定日期往前找最近有資料的交易日。
+    回傳 (data, actual_date, "OK") 或 (None, None, 錯誤訊息)
     """
-    try:
-        r = requests.get(
-            'https://api.finmindtrade.com/api/v4/data',
-            params={
-                'dataset':    'TaiwanStockInstitutionalInvestorsBuySell',
-                'start_date': trade_date_str,
-            },
-            headers=finmind_headers(),
-            timeout=30
-        )
-        if r.status_code != 200:
-            return None, f"HTTP {r.status_code}: {r.text[:80]}"
-        data = r.json().get('data', [])
-        if not data:
-            return None, "無資料（假日 / token 無效 / 尚未更新）"
-        # 只取當天
-        day_data = [d for d in data if d.get('date', '') == trade_date_str]
-        if not day_data:
-            return None, f"當日({trade_date_str})無法人資料，可能尚未更新"
-        return day_data, "OK"
-    except Exception as e:
-        return None, f"連線異常: {str(e)[:60]}"
+    current = date_obj
+    last_err = "未知錯誤"
+
+    for _ in range(max_attempts):
+        date_str = current.strftime('%Y%m%d')
+        url = url_template.format(date_str)
+        try:
+            r = proxy_get(url, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if data.get('stat') == 'OK':
+                    return data, current, "OK"
+                else:
+                    last_err = f"API狀態: {data.get('stat', '無資料')}"
+            else:
+                last_err = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_err = f"連線異常: {str(e)[:30]}"
+
+        # 往前一個交易日
+        current -= timedelta(days=1)
+        while current.weekday() > 4:
+            current -= timedelta(days=1)
+        time.sleep(1)
+
+    return None, None, last_err
 
 # ────────────────────────────────────────────────
 # Telegram 傳訊
@@ -139,8 +145,8 @@ def get_stock_data(symbol):
         urls = ['https://query1.finance.yahoo.com/v8/finance/chart/^TWII?interval=1m&range=1d']
     else:
         urls = [
-            f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{suffix}?interval=1m&range=1d'
-            for suffix in ['.TW', '.TWO']
+            f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol}{s}?interval=1m&range=1d'
+            for s in ['.TW', '.TWO']
         ]
     for url in urls:
         try:
@@ -168,48 +174,57 @@ def get_last_trading_date():
 # 盤後籌碼報告
 # ────────────────────────────────────────────────
 def generate_post_market_msg():
-    msgs           = []
-    tw_time        = datetime.now(timezone(timedelta(hours=8)))
-    trade_date     = get_last_trading_date()
-    trade_date_str = trade_date.strftime('%Y-%m-%d')
+    msgs       = []
+    tw_time    = datetime.now(timezone(timedelta(hours=8)))
+    trade_date = get_last_trading_date()
 
     msgs.append(f"📊 【盤後籌碼總結】 查詢時間: {tw_time.strftime('%m-%d %H:%M')}")
     msgs.append("-------------------------")
 
-    inst_data, err = fetch_finmind_institutional(trade_date_str)
+    # 1. 三大法人買賣超金額（BFI82U）
+    url_bfi = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?date={}&response=json"
+    data_bfi, actual_date, err_bfi = fetch_twse_rwd(url_bfi, trade_date)
 
-    # 1. 三大法人金額加總
-    if inst_data:
-        f_net = i_net = d_net = 0.0
-        for row in inst_data:
-            name = row.get('name', '')
-            buy  = float(row.get('buy',  0) or 0)
-            sell = float(row.get('sell', 0) or 0)
-            net  = buy - sell
-            if '外資' in name:
-                f_net += net
-            elif '投信' in name:
-                i_net += net
-            elif '自營' in name:
-                d_net += net
-        total = f_net + i_net + d_net
-        msgs.append(f"💰 三大法人買賣超 ({trade_date_str}):")
-        msgs.append(f"   合計: {total/1000:+,.0f} 張")
-        msgs.append(f"   外資: {f_net/1000:+,.0f} 張")
-        msgs.append(f"   投信: {i_net/1000:+,.0f} 張")
-        msgs.append(f"   自營商: {d_net/1000:+,.0f} 張")
+    if data_bfi:
+        try:
+            f_net = i_net = d_net = 0.0
+            idx_name = data_bfi['fields'].index('單位名稱')
+            idx_diff = data_bfi['fields'].index('買賣差額')
+            for row in data_bfi['data']:
+                name = row[idx_name]
+                amt  = float(row[idx_diff].replace(',', ''))
+                if '外資' in name:
+                    f_net += amt
+                elif '投信' in name:
+                    i_net += amt
+                elif '自營' in name:
+                    d_net += amt
+            total = f_net + i_net + d_net
+            date_display = actual_date.strftime('%Y-%m-%d')
+            msgs.append(f"💰 三大法人買賣超 ({date_display}):")
+            msgs.append(f"   合計: {total/1e8:+.2f} 億")
+            msgs.append(f"   外資: {f_net/1e8:+.2f} 億")
+            msgs.append(f"   投信: {i_net/1e8:+.2f} 億")
+            msgs.append(f"   自營商: {d_net/1e8:+.2f} 億")
+            trade_date = actual_date   # 後續查詢沿用同一日期
+        except Exception as e:
+            msgs.append(f"⚠️ 三大法人金額: 解析錯誤 ({e})")
     else:
-        msgs.append(f"⚠️ 三大法人金額: 失敗 ({err})")
+        msgs.append(f"⚠️ 三大法人金額: 失敗 ({err_bfi})")
 
     msgs.append("-------------------------")
 
-    # 2. 外資台指期貨淨未平倉
+    # 2. 外資台指期貨淨未平倉（FinMind 免費資料，無需 token）
     try:
         start_date = (tw_time - timedelta(days=30)).strftime('%Y-%m-%d')
         r = requests.get(
             'https://api.finmindtrade.com/api/v4/data',
-            params={'dataset': 'TaiwanFuturesInstitutionalInvestors', 'data_id': 'TX', 'start_date': start_date},
-            headers=finmind_headers(),
+            params={
+                'dataset':    'TaiwanFuturesInstitutionalInvestors',
+                'data_id':    'TX',
+                'start_date': start_date,
+            },
+            headers=HEADERS_WEB,
             timeout=15
         )
         if r.status_code == 200:
@@ -230,39 +245,57 @@ def generate_post_market_msg():
 
     msgs.append("-------------------------")
 
-    # 3. 個股買賣超排行
-    if inst_data:
-        if not STOCK_NAMES:
-            update_stock_names()
+    # 3. 個股三大法人買賣超排行（T86）
+    url_t86 = "https://www.twse.com.tw/rwd/zh/fund/T86?date={}&selectType=ALL&response=json"
+    data_t86, _, err_t86 = fetch_twse_rwd(url_t86, trade_date)
 
-        stock_net = {}
-        for row in inst_data:
-            code = row.get('stock_id', '')
-            buy  = float(row.get('buy',  0) or 0)
-            sell = float(row.get('sell', 0) or 0)
-            stock_net[code] = stock_net.get(code, 0) + (buy - sell)
+    if data_t86:
+        try:
+            fields   = data_t86['fields']
+            idx_code = fields.index('證券代號')
+            idx_name = fields.index('證券名稱')
 
-        bulk_prices   = fetch_bulk_closing_prices()
-        sorted_stocks = sorted(stock_net.items(), key=lambda x: x[1], reverse=True)
+            # 找「三大法人買賣超股數」欄位
+            idx_diff = next(
+                (i for i, f in enumerate(fields) if '三大法人買賣超股數' in f),
+                None
+            )
+            if idx_diff is None:
+                msgs.append("⚠️ 買賣超排行: 找不到對應欄位")
+            else:
+                parsed = []
+                for row in data_t86['data']:
+                    try:
+                        parsed.append({
+                            'code': row[idx_code],
+                            'name': row[idx_name].strip(),
+                            'net':  int(row[idx_diff].replace(',', ''))
+                        })
+                    except Exception:
+                        pass
 
-        def fmt(stocks, is_buy):
-            lines = []
-            for i, (code, net) in enumerate(stocks):
-                name  = STOCK_NAMES.get(code, '')
-                lots  = abs(int(net)) // 1000
-                price = bulk_prices.get(code, '')
-                pd    = f'({price})' if price else '(無報價)'
-                act   = '買' if is_buy else '賣'
-                lines.append(f"{i+1}. {code} {name} {pd} | {act} {lots:,} 張")
-            return lines
+                sorted_data = sorted(parsed, key=lambda x: x['net'], reverse=True)
+                bulk_prices = fetch_bulk_closing_prices()
 
-        msgs.append("🔥 【法人買超前 20 名】")
-        msgs.extend(fmt(sorted_stocks[:20], True))
-        msgs.append("-------------------------")
-        msgs.append("🩸 【法人賣超前 20 名】")
-        msgs.extend(fmt(list(reversed(sorted_stocks[-20:])), False))
+                def fmt(stocks, is_buy):
+                    lines = []
+                    for i, item in enumerate(stocks):
+                        price = bulk_prices.get(item['code'], '')
+                        pd    = f"({price})" if price else "(無報價)"
+                        lots  = abs(item['net']) // 1000
+                        act   = "買" if is_buy else "賣"
+                        lines.append(f"{i+1}. {item['code']} {item['name']} {pd} | {act} {lots:,} 張")
+                    return lines
+
+                msgs.append("🔥 【法人買超前 20 名】")
+                msgs.extend(fmt(sorted_data[:20], True))
+                msgs.append("-------------------------")
+                msgs.append("🩸 【法人賣超前 20 名】")
+                msgs.extend(fmt(list(reversed(sorted_data[-20:])), False))
+        except Exception as e:
+            msgs.append(f"⚠️ 買賣超排行: 解析錯誤 ({e})")
     else:
-        msgs.append(f"⚠️ 買賣超排行: 失敗 ({err})")
+        msgs.append(f"⚠️ 買賣超排行: 失敗 ({err_t86})")
 
     return "\n".join(msgs)
 
@@ -290,8 +323,7 @@ def analyze_and_alert(symbol, tw_time):
 
     if not STOCK_NAMES:
         update_stock_names()
-    name     = STOCK_NAMES.get(symbol, '')
-    disp_sym = f"{symbol} {name}".strip()
+    disp = f"{symbol} {STOCK_NAMES.get(symbol, '')}".strip()
 
     timestamps = data['timestamp']
     q          = data['indicators']['quote'][0]
@@ -304,24 +336,23 @@ def analyze_and_alert(symbol, tw_time):
             'open_price': opens[0] if opens else 0,
         }
 
-    state        = INTRADAY_STATE[symbol]
-    current_time = tw_time.strftime('%H:%M')
-    current_min  = tw_time.minute
+    state = INTRADAY_STATE[symbol]
+    t     = tw_time.strftime('%H:%M')
 
     if not timestamps or not closes[-1]:
         return
 
-    price   = closes[-1]
-    vol     = volumes[-1] if volumes[-1] is not None else 0
-    alerts  = []
+    price  = closes[-1]
+    vol    = volumes[-1] if volumes[-1] is not None else 0
+    alerts = []
 
-    if current_time >= '09:00' and not state['reported_open']:
-        alerts.append(f"🎯 【開盤】{disp_sym} 開盤: {state['open_price']:.2f}")
+    if t >= '09:00' and not state['reported_open']:
+        alerts.append(f"🎯 【開盤】{disp} 開盤: {state['open_price']:.2f}")
         state['reported_open'] = True
         state['day_high']      = highs[0] if highs[0] else price
         state['max_vol']       = volumes[0] if volumes[0] else 0
 
-    if current_time >= '09:20' and not state['reported_0920']:
+    if t >= '09:20' and not state['reported_0920']:
         max_v, max_p = 0, 0
         for i, ts in enumerate(timestamps):
             dt = datetime.fromtimestamp(ts, timezone(timedelta(hours=8)))
@@ -330,28 +361,28 @@ def analyze_and_alert(symbol, tw_time):
                 if v > max_v:
                     max_v, max_p = v, closes[i]
         if max_v > 0:
-            alerts.append(f"📊 【09:20結算】{disp_sym} 早盤最大量: {max_p:.2f} (量: {max_v})")
+            alerts.append(f"📊 【09:20結算】{disp} 早盤最大量: {max_p:.2f} (量: {max_v})")
         state['reported_0920'] = True
 
-    if current_min in [0, 30] and '09:30' <= current_time <= '13:00':
-        if state['last_30m_report'] != current_time:
-            alerts.append(f"⏱ 【定時】{disp_sym} 現價: {price:.2f}")
-            state['last_30m_report'] = current_time
+    if tw_time.minute in [0, 30] and '09:30' <= t <= '13:00':
+        if state['last_30m_report'] != t:
+            alerts.append(f"⏱ 【定時】{disp} 現價: {price:.2f}")
+            state['last_30m_report'] = t
 
-    if price > state['day_high'] and current_time > '09:00':
-        alerts.append(f"🔥 【創新高】{disp_sym} 新高: {price:.2f}")
+    if price > state['day_high'] and t > '09:00':
+        alerts.append(f"🔥 【創新高】{disp} 新高: {price:.2f}")
         state['day_high'] = price
 
-    if vol > state['max_vol'] and current_time > '09:00':
-        alerts.append(f"💥 【爆量】{disp_sym} 單分鐘天量: {vol} 張，現價: {price:.2f}")
+    if vol > state['max_vol'] and t > '09:00':
+        alerts.append(f"💥 【爆量】{disp} 單分鐘天量: {vol} 張，現價: {price:.2f}")
         state['max_vol'] = vol
 
-    if current_time >= '13:30' and not state['reported_close']:
-        alerts.append(f"🏁 【收盤】{disp_sym} 收盤: {price:.2f}")
+    if t >= '13:30' and not state['reported_close']:
+        alerts.append(f"🏁 【收盤】{disp} 收盤: {price:.2f}")
         state['reported_close'] = True
 
     if alerts:
-        send(CHAT_ID, f"[{current_time}]\n" + "\n".join(alerts))
+        send(CHAT_ID, f"[{t}]\n" + "\n".join(alerts))
 
 # ────────────────────────────────────────────────
 # Telegram 指令處理
@@ -390,8 +421,7 @@ def handle(update):
     elif text.startswith('/price'):
         if not STOCK_NAMES:
             update_stock_names()
-        parts = text.strip().split()
-
+        parts   = text.strip().split()
         symbols = parts[1:] if len(parts) > 1 else TRACK_LIST
         if not symbols:
             send(chat_id, "目前無追蹤清單，請用 /track 新增，或輸入 /price [代號]。")
@@ -415,9 +445,8 @@ def handle(update):
                 lines.append("-------------------------")
 
         for sym in symbols:
-            name     = STOCK_NAMES.get(sym, '')
-            disp     = f"{sym} {name}".strip()
-            data     = get_stock_data(sym)
+            disp = f"{sym} {STOCK_NAMES.get(sym, '')}".strip()
+            data = get_stock_data(sym)
             if data and data.get('indicators', {}).get('quote', []):
                 meta  = data.get('meta', {})
                 prev  = meta.get('chartPreviousClose') or meta.get('previousClose')
