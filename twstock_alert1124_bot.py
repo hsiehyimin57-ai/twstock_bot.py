@@ -1,4 +1,5 @@
 import os, json, logging, time, threading, requests
+import urllib.parse
 from datetime import datetime, timezone, timedelta
 
 logging.basicConfig(level=logging.INFO)
@@ -11,7 +12,7 @@ TRACK_LIST = []
 INTRADAY_STATE = {}
 STOCK_NAMES = {}
 
-# 偽裝成一般使用者的瀏覽器標頭，對抗防火牆
+# 偽裝成一般使用者的瀏覽器標頭
 HEADERS_WEB = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
@@ -19,48 +20,68 @@ HEADERS_WEB = {
     'X-Requested-With': 'XMLHttpRequest'
 }
 
+def get_proxy_urls(target_url):
+    """產生多條代理跳板路徑，對抗 IP 封鎖"""
+    encoded = urllib.parse.quote(target_url, safe='')
+    return [
+        target_url, # 1. 嘗試直連
+        f"https://api.allorigins.win/raw?url={encoded}", # 2. AllOrigins 跳板
+        f"https://api.codetabs.com/v1/proxy?quest={encoded}" # 3. CodeTabs 跳板
+    ]
+
 def update_stock_names():
     global STOCK_NAMES
     logging.info("正在更新全台股票名稱清單...")
+    
+    # 透過跳板抓取證交所名稱
     try:
-        r = requests.get("https://api.finmindtrade.com/api/v4/data?dataset=TaiwanStockInfo", headers=HEADERS_WEB, timeout=10)
-        if r.status_code == 200:
-            for item in r.json().get('data', []):
-                STOCK_NAMES[str(item.get('stock_id', ''))] = item.get('stock_name', '')
-            if STOCK_NAMES:
-                return
-    except Exception:
-        pass
+        urls = get_proxy_urls('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL')
+        for url in urls:
+            try:
+                r = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                if r.status_code == 200:
+                    for item in r.json():
+                        STOCK_NAMES[str(item.get('Code', ''))] = item.get('Name', '')
+                    if STOCK_NAMES: break
+            except: pass
+    except: pass
 
+    # 補充櫃買中心名稱
     try:
-        r_twse = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', headers=HEADERS_WEB, timeout=10)
-        if r_twse.status_code == 200:
-            for item in r_twse.json():
-                STOCK_NAMES[str(item.get('Code', ''))] = item.get('Name', '')
-        r_tpex = requests.get('https://www.tpex.org.tw/openapi/v1/t187ap03_L', headers=HEADERS_WEB, timeout=10)
-        if r_tpex.status_code == 200:
-            for item in r_tpex.json():
-                STOCK_NAMES[str(item.get('SecuritiesCompanyCode', ''))] = item.get('CompanyName', '')
-    except Exception:
-        pass
+        urls = get_proxy_urls('https://www.tpex.org.tw/openapi/v1/t187ap03_L')
+        for url in urls:
+            try:
+                r = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                if r.status_code == 200:
+                    for item in r.json():
+                        STOCK_NAMES[str(item.get('SecuritiesCompanyCode', ''))] = item.get('CompanyName', '')
+                    if STOCK_NAMES: break
+            except: pass
+    except: pass
 
 def fetch_bulk_closing_prices():
-    """一次抓取全市場所有股票的收盤價，避免向 Yahoo 發出 40 次請求導致逾時"""
     prices = {}
     try:
-        r1 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', headers=HEADERS_WEB, timeout=10)
-        if r1.status_code == 200:
-            for item in r1.json():
-                prices[item.get('Code', '')] = item.get('ClosingPrice', '')
-    except:
-        pass
+        for url in get_proxy_urls('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL'):
+            try:
+                r1 = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                if r1.status_code == 200:
+                    for item in r1.json():
+                        prices[item.get('Code', '')] = item.get('ClosingPrice', '')
+                    break
+            except: pass
+    except: pass
+    
     try:
-        r2 = requests.get('https://www.tpex.org.tw/openapi/v1/t187ap03_L', headers=HEADERS_WEB, timeout=10)
-        if r2.status_code == 200:
-            for item in r2.json():
-                prices[item.get('SecuritiesCompanyCode', '')] = item.get('ClosingPrice', '')
-    except:
-        pass
+        for url in get_proxy_urls('https://www.tpex.org.tw/openapi/v1/t187ap03_L'):
+            try:
+                r2 = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                if r2.status_code == 200:
+                    for item in r2.json():
+                        prices[item.get('SecuritiesCompanyCode', '')] = item.get('ClosingPrice', '')
+                    break
+            except: pass
+    except: pass
     return prices
 
 def send(chat_id, text):
@@ -97,31 +118,32 @@ def get_last_trading_date():
     return trade_time
 
 def fetch_twse_rwd_api(url_template, date_obj, max_attempts=5):
-    last_error = "未知錯誤"
+    """加入了多重跳板的證交所連線機制"""
     current_date = date_obj
+    last_error = "連線失敗"
     
     for _ in range(max_attempts):
         date_str = current_date.strftime('%Y%m%d')
-        url = url_template.format(date_str)
-        try:
-            r = requests.get(url, headers=HEADERS_WEB, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get('stat') == 'OK':
-                    return data, current_date, "OK"
-                else:
-                    last_error = f"API狀態: {data.get('stat', '無資料')}"
-            else:
-                last_error = f"HTTP被拒 {r.status_code}"
-        except Exception as e:
-            last_error = f"連線異常: {str(e)[:20]}"
-
+        target_url = url_template.format(date_str)
+        
+        # 輪詢跳板
+        for url in get_proxy_urls(target_url):
+            try:
+                r = requests.get(url, headers=HEADERS_WEB, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
+                    if data.get('stat') == 'OK':
+                        return data, current_date, "OK"
+            except:
+                continue # 失敗就換下一個代理
+                
+        # 該日期的所有跳板都失敗，往前推一天
         current_date -= timedelta(days=1)
         while current_date.weekday() > 4:
             current_date -= timedelta(days=1)
         time.sleep(1) 
         
-    return None, None, last_error
+    return None, None, "海外IP遭封鎖且所有跳板失效"
 
 def generate_post_market_msg():
     msgs = []
@@ -143,12 +165,9 @@ def generate_post_market_msg():
             for row in data_bfi['data']:
                 name = row[idx_name]
                 amt = float(row[idx_diff].replace(',', ''))
-                if '外資' in name:
-                    f_net += amt
-                elif '投信' in name:
-                    i_net += amt
-                elif '自營' in name:
-                    d_net += amt
+                if '外資' in name: f_net += amt
+                elif '投信' in name: i_net += amt
+                elif '自營' in name: d_net += amt
             total_net = f_net + i_net + d_net
             date_display = actual_date.strftime('%Y-%m-%d')
             msgs.append(f"💰 三大法人買賣超 ({date_display}): {total_net/1e8:+.2f} 億")
@@ -166,23 +185,28 @@ def generate_post_market_msg():
     # 2. 外資期貨未平倉
     try:
         start_date = (tw_time - timedelta(days=30)).strftime('%Y-%m-%d')
-        fm_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id=TX&start_date={start_date}"
-        r = requests.get(fm_url, headers=HEADERS_WEB, timeout=10)
-        if r.status_code == 200:
-            data = r.json().get('data', [])
-            fi_data = [d for d in data if '外資' in d.get('name', '') and d.get('data_id') == 'TX']
-            if len(fi_data) >= 2:
-                fi_data.sort(key=lambda x: x['date']) 
-                recent_date = fi_data[-1].get('date', '')
-                today_oi = fi_data[-1].get('long_short_oi_net_volume', 0)
-                yest_oi = fi_data[-2].get('long_short_oi_net_volume', 0)
-                diff = today_oi - yest_oi
-                msgs.append(f"📈 外資台指淨未平倉 ({recent_date}):")
-                msgs.append(f"   {today_oi:,} 口 (較前日 {diff:+,} 口)")
-            else:
-                msgs.append("📈 外資台指淨未平倉: 近30日無足夠資料")
+        target_fm_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id=TX&start_date={start_date}"
+        
+        fi_data = []
+        for url in get_proxy_urls(target_fm_url):
+            try:
+                r = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                if r.status_code == 200:
+                    data = r.json().get('data', [])
+                    fi_data = [d for d in data if '外資' in d.get('name', '') and d.get('data_id') == 'TX']
+                    if fi_data: break
+            except: pass
+            
+        if len(fi_data) >= 2:
+            fi_data.sort(key=lambda x: x['date']) 
+            recent_date = fi_data[-1].get('date', '')
+            today_oi = fi_data[-1].get('long_short_oi_net_volume', 0)
+            yest_oi = fi_data[-2].get('long_short_oi_net_volume', 0)
+            diff = today_oi - yest_oi
+            msgs.append(f"📈 外資台指淨未平倉 ({recent_date}):")
+            msgs.append(f"   {today_oi:,} 口 (較前日 {diff:+,} 口)")
         else:
-            msgs.append(f"⚠️ 期貨未平倉: 連線失敗 ({r.status_code})")
+            msgs.append("📈 外資台指淨未平倉: 近30日無足夠資料")
     except Exception:
         msgs.append("⚠️ 期貨未平倉: 抓取發生錯誤")
 
@@ -196,12 +220,10 @@ def generate_post_market_msg():
         try:
             idx_code = data_t86['fields'].index('證券代號')
             idx_name = data_t86['fields'].index('證券名稱')
-            
             idx_diff = -1
             for i, field in enumerate(data_t86['fields']):
                 if '三大法人買賣超股數' in field:
-                    idx_diff = i
-                    break
+                    idx_diff = i; break
                     
             if idx_diff != -1:
                 parsed_data = []
@@ -210,17 +232,14 @@ def generate_post_market_msg():
                     name = row[idx_name].strip()
                     diff_str = row[idx_diff].replace(',', '')
                     try:
-                        diff_int = int(diff_str)
-                        parsed_data.append({'Code': code, 'Name': name, 'Diff_int': diff_int})
-                    except:
-                        pass
+                        parsed_data.append({'Code': code, 'Name': name, 'Diff_int': int(diff_str)})
+                    except: pass
                 
                 sorted_data = sorted(parsed_data, key=lambda x: x['Diff_int'], reverse=True)
                 top_buy = sorted_data[:20]
                 top_sell = sorted_data[-20:]
                 top_sell.reverse()
                 
-                # 取得全市場收盤價統包資料 (極速模式，不再迴圈卡頓)
                 bulk_prices = fetch_bulk_closing_prices()
 
                 def format_stock_list(stock_list, is_buy):
@@ -228,12 +247,9 @@ def generate_post_market_msg():
                     for idx, item in enumerate(stock_list):
                         sym = item.get('Code', '')
                         name = item.get('Name', '').strip()
-                        shares = item.get('Diff_int', 0)
-                        lots = abs(shares) // 1000 
-                        
+                        lots = abs(item.get('Diff_int', 0)) // 1000 
                         price_str = bulk_prices.get(sym, "")
                         price_disp = f"({price_str})" if price_str else "(無報價)"
-                        
                         action = "買" if is_buy else "賣"
                         lines.append(f"{idx+1}. {sym} {name} {price_disp} | {action} {lots:,} 張")
                     return lines
@@ -244,7 +260,7 @@ def generate_post_market_msg():
                 msgs.append("🩸 【法人賣超前 20 名】")
                 msgs.extend(format_stock_list(top_sell, False))
             else:
-                msgs.append("⚠️ 買賣超排行: 找不到官方資料對應欄位")
+                msgs.append("⚠️ 買賣超排行: 找不到對應欄位")
         except Exception:
             msgs.append("⚠️ 買賣超排行: 解析錯誤")
     else:
@@ -253,9 +269,8 @@ def generate_post_market_msg():
     return "\n".join(msgs)
 
 def post_market_job(chat_id):
-    """加上終極安全網，如果掛掉一定會傳錯誤訊息，不再已讀不回"""
     try:
-        send(chat_id, "⏳ 正在極速彙整盤後籌碼與個股現價，請稍候...")
+        send(chat_id, "⏳ 正在透過全球代理伺服器抓取籌碼資料，請稍候...")
         msg = generate_post_market_msg()
         if len(msg) > 4000:
             send(chat_id, msg[:4000])
@@ -263,8 +278,7 @@ def post_market_job(chat_id):
         else:
             send(chat_id, msg)
     except Exception as e:
-        logging.error(f"Post market job crashed: {e}")
-        send(chat_id, f"❌ 系統發生預期外錯誤，無法產出報表。\n錯誤內容: {str(e)[:50]}")
+        send(chat_id, f"❌ 系統發生預期外錯誤: {str(e)[:50]}")
 
 def analyze_and_alert(symbol, tw_time):
     data = get_stock_data(symbol)
