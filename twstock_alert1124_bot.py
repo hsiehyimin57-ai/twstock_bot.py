@@ -12,10 +12,11 @@ TRACK_LIST = []
 INTRADAY_STATE = {}
 STOCK_NAMES = {}
 
-# 偽裝成一般使用者的瀏覽器標頭
+# 偽裝成一般使用者的瀏覽器標頭，並開啟 GZIP 壓縮大幅降低傳輸大小
 HEADERS_WEB = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Referer': 'https://www.twse.com.tw/',
     'X-Requested-With': 'XMLHttpRequest'
 }
@@ -25,20 +26,20 @@ def get_proxy_urls(target_url):
     encoded = urllib.parse.quote(target_url, safe='')
     return [
         target_url, # 1. 嘗試直連
-        f"https://api.allorigins.win/raw?url={encoded}", # 2. AllOrigins 跳板
-        f"https://api.codetabs.com/v1/proxy?quest={encoded}" # 3. CodeTabs 跳板
+        f"https://api.allorigins.win/raw?url={encoded}", # 2. AllOrigins
+        f"https://corsproxy.io/?{encoded}",              # 3. CorsProxy
+        f"https://api.codetabs.com/v1/proxy?quest={encoded}" # 4. CodeTabs
     ]
 
 def update_stock_names():
     global STOCK_NAMES
     logging.info("正在更新全台股票名稱清單...")
     
-    # 透過跳板抓取證交所名稱
     try:
         urls = get_proxy_urls('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL')
         for url in urls:
             try:
-                r = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                r = requests.get(url, headers=HEADERS_WEB, timeout=15)
                 if r.status_code == 200:
                     for item in r.json():
                         STOCK_NAMES[str(item.get('Code', ''))] = item.get('Name', '')
@@ -46,12 +47,11 @@ def update_stock_names():
             except: pass
     except: pass
 
-    # 補充櫃買中心名稱
     try:
         urls = get_proxy_urls('https://www.tpex.org.tw/openapi/v1/t187ap03_L')
         for url in urls:
             try:
-                r = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                r = requests.get(url, headers=HEADERS_WEB, timeout=15)
                 if r.status_code == 200:
                     for item in r.json():
                         STOCK_NAMES[str(item.get('SecuritiesCompanyCode', ''))] = item.get('CompanyName', '')
@@ -64,7 +64,7 @@ def fetch_bulk_closing_prices():
     try:
         for url in get_proxy_urls('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL'):
             try:
-                r1 = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                r1 = requests.get(url, headers=HEADERS_WEB, timeout=15)
                 if r1.status_code == 200:
                     for item in r1.json():
                         prices[item.get('Code', '')] = item.get('ClosingPrice', '')
@@ -75,7 +75,7 @@ def fetch_bulk_closing_prices():
     try:
         for url in get_proxy_urls('https://www.tpex.org.tw/openapi/v1/t187ap03_L'):
             try:
-                r2 = requests.get(url, headers=HEADERS_WEB, timeout=10)
+                r2 = requests.get(url, headers=HEADERS_WEB, timeout=15)
                 if r2.status_code == 200:
                     for item in r2.json():
                         prices[item.get('SecuritiesCompanyCode', '')] = item.get('ClosingPrice', '')
@@ -126,18 +126,18 @@ def fetch_twse_rwd_api(url_template, date_obj, max_attempts=5):
         date_str = current_date.strftime('%Y%m%d')
         target_url = url_template.format(date_str)
         
-        # 輪詢跳板
+        # 輪詢跳板 (超時時間加長至 25 秒，確保代理伺服器有時間下載)
         for url in get_proxy_urls(target_url):
             try:
-                r = requests.get(url, headers=HEADERS_WEB, timeout=15)
+                r = requests.get(url, headers=HEADERS_WEB, timeout=25)
                 if r.status_code == 200:
                     data = r.json()
                     if data.get('stat') == 'OK':
                         return data, current_date, "OK"
             except:
-                continue # 失敗就換下一個代理
+                continue 
                 
-        # 該日期的所有跳板都失敗，往前推一天
+        # 若當天無資料或跳板全失敗，往前推一天
         current_date -= timedelta(days=1)
         while current_date.weekday() > 4:
             current_date -= timedelta(days=1)
@@ -182,20 +182,27 @@ def generate_post_market_msg():
 
     msgs.append("-------------------------")
 
-    # 2. 外資期貨未平倉
+    # 2. 外資期貨未平倉 (加強版：嘗試 TX 與 TXF 兩種代號，並加入代理跳板)
     try:
         start_date = (tw_time - timedelta(days=30)).strftime('%Y-%m-%d')
-        target_fm_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id=TX&start_date={start_date}"
-        
         fi_data = []
-        for url in get_proxy_urls(target_fm_url):
-            try:
-                r = requests.get(url, headers=HEADERS_WEB, timeout=10)
-                if r.status_code == 200:
-                    data = r.json().get('data', [])
-                    fi_data = [d for d in data if '外資' in d.get('name', '') and d.get('data_id') == 'TX']
-                    if fi_data: break
-            except: pass
+        
+        for data_id in ['TX', 'TXF']:
+            target_fm_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id={data_id}&start_date={start_date}"
+            for url in get_proxy_urls(target_fm_url):
+                try:
+                    r = requests.get(url, headers=HEADERS_WEB, timeout=15)
+                    if r.status_code == 200:
+                        json_resp = r.json()
+                        if json_resp.get('status') == 200:
+                            data = json_resp.get('data', [])
+                            # 篩選外資
+                            current_fi = [d for d in data if '外資' in d.get('name', '')]
+                            if current_fi:
+                                fi_data = current_fi
+                                break
+                except: pass
+            if fi_data: break # 成功抓到就不再試下一個代號
             
         if len(fi_data) >= 2:
             fi_data.sort(key=lambda x: x['date']) 
@@ -206,14 +213,14 @@ def generate_post_market_msg():
             msgs.append(f"📈 外資台指淨未平倉 ({recent_date}):")
             msgs.append(f"   {today_oi:,} 口 (較前日 {diff:+,} 口)")
         else:
-            msgs.append("📈 外資台指淨未平倉: 近30日無足夠資料")
+            msgs.append("📈 外資台指淨未平倉: 近30日無足夠資料 (可能達免費API次數上限)")
     except Exception:
         msgs.append("⚠️ 期貨未平倉: 抓取發生錯誤")
 
     msgs.append("-------------------------")
 
-    # 3. 三大法人買賣超前20名
-    url_t86 = "https://www.twse.com.tw/rwd/zh/fund/T86?date={}&selectType=ALL&response=json"
+    # 3. 三大法人買賣超前20名 (關鍵修正：ALLBUT0999 剔除權證，大幅降低檔案大小防斷線)
+    url_t86 = "https://www.twse.com.tw/rwd/zh/fund/T86?date={}&selectType=ALLBUT0999&response=json"
     data_t86, _, err_t86 = fetch_twse_rwd_api(url_t86, trade_time)
     
     if data_t86:
@@ -270,7 +277,7 @@ def generate_post_market_msg():
 
 def post_market_job(chat_id):
     try:
-        send(chat_id, "⏳ 正在透過全球代理伺服器抓取籌碼資料，請稍候...")
+        send(chat_id, "⏳ 正在透過全球代理伺服器極速抓取籌碼資料，請稍候...")
         msg = generate_post_market_msg()
         if len(msg) > 4000:
             send(chat_id, msg[:4000])
