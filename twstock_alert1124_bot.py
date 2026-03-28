@@ -11,7 +11,7 @@ TRACK_LIST = []
 INTRADAY_STATE = {}
 STOCK_NAMES = {}
 
-# 偽裝成一般使用者的瀏覽器標頭，對抗證交所防火牆
+# 偽裝成一般使用者的瀏覽器標頭，對抗防火牆
 HEADERS_WEB = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
     'Accept': 'application/json, text/javascript, */*; q=0.01',
@@ -29,7 +29,7 @@ def update_stock_names():
                 STOCK_NAMES[str(item.get('stock_id', ''))] = item.get('stock_name', '')
             if STOCK_NAMES:
                 return
-    except Exception as e:
+    except Exception:
         pass
 
     try:
@@ -41,8 +41,27 @@ def update_stock_names():
         if r_tpex.status_code == 200:
             for item in r_tpex.json():
                 STOCK_NAMES[str(item.get('SecuritiesCompanyCode', ''))] = item.get('CompanyName', '')
-    except Exception as e:
+    except Exception:
         pass
+
+def fetch_bulk_closing_prices():
+    """一次抓取全市場所有股票的收盤價，避免向 Yahoo 發出 40 次請求導致逾時"""
+    prices = {}
+    try:
+        r1 = requests.get('https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL', headers=HEADERS_WEB, timeout=10)
+        if r1.status_code == 200:
+            for item in r1.json():
+                prices[item.get('Code', '')] = item.get('ClosingPrice', '')
+    except:
+        pass
+    try:
+        r2 = requests.get('https://www.tpex.org.tw/openapi/v1/t187ap03_L', headers=HEADERS_WEB, timeout=10)
+        if r2.status_code == 200:
+            for item in r2.json():
+                prices[item.get('SecuritiesCompanyCode', '')] = item.get('ClosingPrice', '')
+    except:
+        pass
+    return prices
 
 def send(chat_id, text):
     try:
@@ -78,7 +97,6 @@ def get_last_trading_date():
     return trade_time
 
 def fetch_twse_rwd_api(url_template, date_obj, max_attempts=5):
-    """使用證交所最新的 RWD API，並附上完整偽裝標頭"""
     last_error = "未知錯誤"
     current_date = date_obj
     
@@ -101,7 +119,7 @@ def fetch_twse_rwd_api(url_template, date_obj, max_attempts=5):
         current_date -= timedelta(days=1)
         while current_date.weekday() > 4:
             current_date -= timedelta(days=1)
-        time.sleep(1.5) # 降低請求頻率
+        time.sleep(1) 
         
     return None, None, last_error
 
@@ -113,7 +131,7 @@ def generate_post_market_msg():
     msgs.append(f"📊 【盤後籌碼總結】 查詢時間: {tw_time.strftime('%m-%d %H:%M')}")
     msgs.append("-------------------------")
 
-    # 1. 三大法人買賣超金額 (改用 RWD API)
+    # 1. 三大法人買賣超金額
     url_bfi = "https://www.twse.com.tw/rwd/zh/fund/BFI82U?date={}&response=json"
     data_bfi, actual_date, err_bfi = fetch_twse_rwd_api(url_bfi, trade_time)
     
@@ -138,14 +156,14 @@ def generate_post_market_msg():
             msgs.append(f"   投信: {i_net/1e8:+.2f} 億")
             msgs.append(f"   自營商: {d_net/1e8:+.2f} 億")
             trade_time = actual_date 
-        except Exception as e:
-            msgs.append(f"⚠️ 三大法人金額: 解析錯誤")
+        except Exception:
+            msgs.append("⚠️ 三大法人金額: 解析錯誤")
     else:
         msgs.append(f"⚠️ 三大法人金額: 失敗 ({err_bfi})")
 
     msgs.append("-------------------------")
 
-    # 2. 外資期貨未平倉 (天數拉長為30天)
+    # 2. 外資期貨未平倉
     try:
         start_date = (tw_time - timedelta(days=30)).strftime('%Y-%m-%d')
         fm_url = f"https://api.finmindtrade.com/api/v4/data?dataset=TaiwanFuturesInstitutionalInvestors&data_id=TX&start_date={start_date}"
@@ -165,12 +183,12 @@ def generate_post_market_msg():
                 msgs.append("📈 外資台指淨未平倉: 近30日無足夠資料")
         else:
             msgs.append(f"⚠️ 期貨未平倉: 連線失敗 ({r.status_code})")
-    except Exception as e:
+    except Exception:
         msgs.append("⚠️ 期貨未平倉: 抓取發生錯誤")
 
     msgs.append("-------------------------")
 
-    # 3. 三大法人買賣超前20名 (改用 RWD API)
+    # 3. 三大法人買賣超前20名
     url_t86 = "https://www.twse.com.tw/rwd/zh/fund/T86?date={}&selectType=ALL&response=json"
     data_t86, _, err_t86 = fetch_twse_rwd_api(url_t86, trade_time)
     
@@ -201,6 +219,9 @@ def generate_post_market_msg():
                 top_buy = sorted_data[:20]
                 top_sell = sorted_data[-20:]
                 top_sell.reverse()
+                
+                # 取得全市場收盤價統包資料 (極速模式，不再迴圈卡頓)
+                bulk_prices = fetch_bulk_closing_prices()
 
                 def format_stock_list(stock_list, is_buy):
                     lines = []
@@ -209,27 +230,12 @@ def generate_post_market_msg():
                         name = item.get('Name', '').strip()
                         shares = item.get('Diff_int', 0)
                         lots = abs(shares) // 1000 
-
-                        price_info = "無報價"
-                        s_data = get_stock_data(sym)
-                        if s_data and s_data.get('indicators', {}).get('quote', []):
-                            meta = s_data.get('meta', {})
-                            prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
-                            closes = s_data['indicators']['quote'][0].get('close', [])
-                            valid_closes = [c for c in closes if c is not None]
-                            
-                            if valid_closes:
-                                curr = valid_closes[-1]
-                                if prev_close:
-                                    chg = curr - prev_close
-                                    pct = (chg / prev_close) * 100
-                                    price_info = f"{curr:.2f} ({chg:+.2f}, {pct:+.2f}%)"
-                                else:
-                                    price_info = f"{curr:.2f}"
-                                    
+                        
+                        price_str = bulk_prices.get(sym, "")
+                        price_disp = f"({price_str})" if price_str else "(無報價)"
+                        
                         action = "買" if is_buy else "賣"
-                        lines.append(f"{idx+1}. {sym} {name}: {price_info} | {action} {lots:,} 張")
-                        time.sleep(0.05) 
+                        lines.append(f"{idx+1}. {sym} {name} {price_disp} | {action} {lots:,} 張")
                     return lines
 
                 msgs.append("🔥 【法人買超前 20 名】")
@@ -239,30 +245,32 @@ def generate_post_market_msg():
                 msgs.extend(format_stock_list(top_sell, False))
             else:
                 msgs.append("⚠️ 買賣超排行: 找不到官方資料對應欄位")
-        except Exception as e:
-            msgs.append(f"⚠️ 買賣超排行: 解析錯誤")
+        except Exception:
+            msgs.append("⚠️ 買賣超排行: 解析錯誤")
     else:
         msgs.append(f"⚠️ 買賣超排行: 失敗 ({err_t86})")
 
     return "\n".join(msgs)
 
 def post_market_job(chat_id):
-    send(chat_id, "⏳ 正在彙整盤後籌碼與個股現價，約需20~30秒，請稍候...")
-    msg = generate_post_market_msg()
-    if len(msg) > 4000:
-        send(chat_id, msg[:4000])
-        send(chat_id, msg[4000:])
-    else:
-        send(chat_id, msg)
+    """加上終極安全網，如果掛掉一定會傳錯誤訊息，不再已讀不回"""
+    try:
+        send(chat_id, "⏳ 正在極速彙整盤後籌碼與個股現價，請稍候...")
+        msg = generate_post_market_msg()
+        if len(msg) > 4000:
+            send(chat_id, msg[:4000])
+            send(chat_id, msg[4000:])
+        else:
+            send(chat_id, msg)
+    except Exception as e:
+        logging.error(f"Post market job crashed: {e}")
+        send(chat_id, f"❌ 系統發生預期外錯誤，無法產出報表。\n錯誤內容: {str(e)[:50]}")
 
 def analyze_and_alert(symbol, tw_time):
     data = get_stock_data(symbol)
-    if not data:
-        return
+    if not data: return
 
-    if not STOCK_NAMES:
-        update_stock_names()
-
+    if not STOCK_NAMES: update_stock_names()
     name = STOCK_NAMES.get(symbol, '')
     disp_sym = f"{symbol} {name}".strip()
 
@@ -275,12 +283,8 @@ def analyze_and_alert(symbol, tw_time):
     
     if symbol not in INTRADAY_STATE:
         INTRADAY_STATE[symbol] = {
-            'reported_open': False,
-            'reported_0920': False,
-            'reported_close': False,
-            'last_30m_report': None,
-            'day_high': 0,
-            'max_vol': 0,
+            'reported_open': False, 'reported_0920': False, 'reported_close': False,
+            'last_30m_report': None, 'day_high': 0, 'max_vol': 0,
             'open_price': opens[0] if opens else 0
         }
     
@@ -288,8 +292,7 @@ def analyze_and_alert(symbol, tw_time):
     current_time_str = tw_time.strftime('%H:%M')
     current_minute = tw_time.minute
     
-    if not timestamps or not closes[-1]:
-        return
+    if not timestamps or not closes[-1]: return
 
     current_price = closes[-1]
     current_vol = volumes[-1] if volumes[-1] is not None else 0
@@ -302,8 +305,7 @@ def analyze_and_alert(symbol, tw_time):
         state['max_vol'] = volumes[0] if volumes[0] else 0
 
     if current_time_str >= '09:20' and not state['reported_0920']:
-        max_v = 0
-        max_v_price = 0
+        max_v, max_v_price = 0, 0
         for i, ts in enumerate(timestamps):
             dt = datetime.fromtimestamp(ts, timezone(timedelta(hours=8)))
             if '09:01' <= dt.strftime('%H:%M') <= '09:20':
@@ -333,15 +335,13 @@ def analyze_and_alert(symbol, tw_time):
         state['reported_close'] = True
 
     if alerts:
-        msg = f"[{current_time_str}]\n" + "\n".join(alerts)
-        send(CHAT_ID, msg)
+        send(CHAT_ID, f"[{current_time_str}]\n" + "\n".join(alerts))
 
 def handle(update):
     msg = update.get('message', {})
     chat_id = msg.get('chat', {}).get('id')
     text = msg.get('text', '')
-    if chat_id != CHAT_ID:
-        return
+    if chat_id != CHAT_ID: return
         
     if text.startswith('/track'):
         parts = text.strip().split()
@@ -354,10 +354,8 @@ def handle(update):
             send(chat_id, "請輸入要追蹤的股票代號，例如：/track 2330 2603")
             
     elif text.startswith('/list'):
-        if TRACK_LIST:
-            send(chat_id, f"📋 目前追蹤清單：{', '.join(TRACK_LIST)}")
-        else:
-            send(chat_id, "目前沒有追蹤任何股票。請使用 /track 新增。")
+        if TRACK_LIST: send(chat_id, f"📋 目前追蹤清單：{', '.join(TRACK_LIST)}")
+        else: send(chat_id, "目前沒有追蹤任何股票。請使用 /track 新增。")
             
     elif text.startswith('/clear'):
         TRACK_LIST.clear()
@@ -368,14 +366,10 @@ def handle(update):
         threading.Thread(target=post_market_job, args=(chat_id,), daemon=True).start()
 
     elif text.startswith('/price'):
-        if not STOCK_NAMES:
-            update_stock_names()
-            
+        if not STOCK_NAMES: update_stock_names()
         parts = text.strip().split()
-        symbols_to_check = []
         
-        if len(parts) > 1:
-            symbols_to_check = parts[1:]
+        if len(parts) > 1: symbols_to_check = parts[1:]
         else:
             if not TRACK_LIST:
                 send(chat_id, "目前沒有追蹤清單。請使用 /track 新增，或輸入 /price [代號] 查詢。")
@@ -404,14 +398,12 @@ def handle(update):
         for sym in symbols_to_check:
             name = STOCK_NAMES.get(sym, '')
             disp_sym = f"{sym} {name}".strip()
-            
             data = get_stock_data(sym)
             if data and data.get('indicators', {}).get('quote', []):
                 meta = data.get('meta', {})
                 prev_close = meta.get('chartPreviousClose') or meta.get('previousClose')
                 closes = data['indicators']['quote'][0].get('close', [])
                 valid_closes = [c for c in closes if c is not None]
-                
                 if valid_closes:
                     current_price = valid_closes[-1]
                     if prev_close:
@@ -425,9 +417,7 @@ def handle(update):
             else:
                 alerts.append(f"❌ {disp_sym}: 查詢失敗 (請確認代號正確)")
                 
-        if alerts:
-            msg_text = f"[{time_str} 即時報價]\n" + "\n".join(alerts)
-            send(chat_id, msg_text)
+        if alerts: send(chat_id, f"[{time_str} 即時報價]\n" + "\n".join(alerts))
 
 def polling_loop():
     offset = 0
@@ -455,15 +445,11 @@ def market_monitor_loop():
             time.sleep(1)
             
         if time_str == '16:30' and tw_time.second == 0:
-            is_weekday = tw_time.weekday() < 5
-            if is_weekday:
+            if tw_time.weekday() < 5:
                 threading.Thread(target=post_market_job, args=(CHAT_ID,), daemon=True).start()
             time.sleep(1)
             
-        is_trading_hours = '09:00' <= time_str <= '13:35'
-        is_weekday = tw_time.weekday() < 5
-        
-        if TRACK_LIST and is_trading_hours and is_weekday:
+        if TRACK_LIST and '09:00' <= time_str <= '13:35' and tw_time.weekday() < 5:
             for symbol in TRACK_LIST:
                 analyze_and_alert(symbol, tw_time)
                 time.sleep(1)
