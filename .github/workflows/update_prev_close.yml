@@ -1,0 +1,81 @@
+name: 每日更新台股收盤價
+
+on:
+  schedule:
+    # 台灣時間 15:30 = UTC 07:30
+    - cron: '30 7 * * 1-5'
+  workflow_dispatch:   # 允許手動觸發
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: 下載並更新收盤價
+        run: |
+          python3 << 'PYEOF'
+          import requests, json, time
+
+          prices = {}
+
+          # 上市股票
+          try:
+              r = requests.get(
+                  'https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL',
+                  headers={'User-Agent': 'Mozilla/5.0'},
+                  timeout=30
+              )
+              if r.status_code == 200:
+                  for item in r.json():
+                      code = item.get('Code', '')
+                      price = item.get('ClosingPrice', '').replace(',', '')
+                      if code and price:
+                          try:
+                              prices[code] = float(price)
+                          except:
+                              pass
+                  print(f"上市: {len(prices)} 筆")
+          except Exception as e:
+              print(f"上市失敗: {e}")
+
+          time.sleep(2)
+
+          # 上櫃股票
+          try:
+              r = requests.get(
+                  'https://www.tpex.org.tw/openapi/v1/t187ap03_L',
+                  headers={'User-Agent': 'Mozilla/5.0'},
+                  timeout=30
+              )
+              if r.status_code == 200:
+                  count = 0
+                  for item in r.json():
+                      code = item.get('SecuritiesCompanyCode', '')
+                      price = item.get('ClosingPrice', '').replace(',', '')
+                      if code and price:
+                          try:
+                              prices[code] = float(price)
+                              count += 1
+                          except:
+                              pass
+                  print(f"上櫃: {count} 筆")
+          except Exception as e:
+              print(f"上櫃失敗: {e}")
+
+          print(f"總計: {len(prices)} 筆")
+
+          with open('prev_close.json', 'w', encoding='utf-8') as f:
+              json.dump(prices, f, ensure_ascii=False)
+
+          print("prev_close.json 寫入完成")
+          PYEOF
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add prev_close.json
+          git diff --staged --quiet || git commit -m "每日收盤價更新 $(date +%Y-%m-%d)"
+          git push
