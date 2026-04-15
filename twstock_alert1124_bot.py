@@ -304,11 +304,19 @@ def query_mis_single(code):
                     d     = arr[0]
                     z     = d.get('z', '-')
                     o     = d.get('o', '-')
+                    y     = d.get('y', '-')   # 昨收參考價
                     n     = d.get('n', '')
                     price = float(z) if z not in ('-', '', None) else None
                     open_ = float(o) if o not in ('-', '', None) else None
+                    prev  = float(y) if y not in ('-', '', None) else None
                     if price is not None:
-                        return {'price': price, 'open': open_, 'name': n}
+                        # 盤中用 MIS y 欄更新昨收（比 prev_close.json 更即時準確）
+                        if prev and prev > 0 and code not in PREV_CLOSE:
+                            PREV_CLOSE[code] = prev
+                        elif prev and prev > 0:
+                            # y 欄永遠覆蓋，確保昨收是正確的當日參考價
+                            PREV_CLOSE[code] = prev
+                        return {'price': price, 'open': open_, 'name': n, 'prev': prev}
         except Exception:
             pass
     return None
@@ -378,11 +386,11 @@ def make_stock_line(symbol, name, price, prev):
             chg_s = f"{chg_abs:>6.0f}"
         else:
             chg_s = f"{chg_abs:>6.2f}"
-        pct_s = f"{pct:>+5.1f}%"
+        pct_s = f" {pct:>+5.1f}%"  # 前置空格避免與漲跌金額擠在一起
     else:
         arrow = "─"
         chg_s = f"{'--':>6}"
-        pct_s = f"{'--':>6}"
+        pct_s = f" {'--':>5}"
     return f"{arrow}{code_s}{name_s}{price_s}{chg_s}{pct_s}"
 
 def send_table(chat_id, title, lines):
@@ -606,7 +614,8 @@ def analyze_stock(symbol, tw_time):
     price = info['price']
     open_ = info.get('open')
     name  = info.get('name') or STOCK_NAMES.get(symbol, '')
-    prev  = get_prev_close(symbol)
+    # 優先用 MIS 回傳的 y 欄昨收，fallback 才用快取
+    prev  = info.get('prev') or get_prev_close(symbol)
 
     if symbol not in INTRADAY_STATE:
         INTRADAY_STATE[symbol] = {
@@ -752,7 +761,8 @@ def handle(update):
             if info and info.get('price') is not None:
                 curr = info['price']
                 name = info.get('name') or STOCK_NAMES.get(sym, '')
-                prev = get_prev_close(sym)
+                # 優先用 MIS y 欄昨收，確保當日漲跌幅正確
+                prev = info.get('prev') or get_prev_close(sym)
                 rows.append(make_stock_line(sym, name, curr, prev))
             else:
                 rows.append(pad_str(sym, 7) + "查詢失敗")
