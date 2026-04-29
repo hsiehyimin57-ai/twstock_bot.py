@@ -401,7 +401,12 @@ def send_table(chat_id, title, lines):
 # ────────────────────────────────────────────────
 # TWSE RWD API（透過 proxy）
 # ────────────────────────────────────────────────
-def fetch_twse_rwd(url_template, date_obj, max_attempts=5):
+def fetch_twse_rwd(url_template, date_obj, max_attempts=5, strict_date=False):
+    """
+    strict_date=True：只接受與 date_obj 同日的資料，不回退；
+                      若當日資料尚未發布則回傳 (None, None, '資料尚未發布')。
+    strict_date=False（預設）：原本行為，失敗時自動往前一個交易日回退。
+    """
     current  = date_obj
     last_err = "未知錯誤"
     for _ in range(max_attempts):
@@ -417,6 +422,9 @@ def fetch_twse_rwd(url_template, date_obj, max_attempts=5):
                 last_err = f"HTTP {r.status_code}"
         except Exception as e:
             last_err = f"連線異常: {str(e)[:30]}"
+        if strict_date:
+            # 嚴格模式：不往前回退，直接回報尚未發布
+            return None, None, "資料尚未發布"
         current -= timedelta(days=1)
         while current.weekday() > 4:
             current -= timedelta(days=1)
@@ -545,20 +553,47 @@ def generate_post_market_msg():
             rows.append(f"{code}{name}{lots:{lots_w},}")
         return ["```\n" + "\n".join(rows) + "\n```"]
 
-    for label, url_tmpl in [
+    # 排行榜：先嘗試抓今日資料（strict_date=True），
+    # 若尚未發布則最多重試 6 次（每次等 5 分鐘），
+    # 所有重試均失敗才 fallback 抓最近一個交易日。
+    RANK_SOURCES = [
         ("外資",   "https://www.twse.com.tw/rwd/zh/fund/TWT38U?date={}&response=json"),
         ("投信",   "https://www.twse.com.tw/rwd/zh/fund/TWT44U?date={}&response=json"),
         ("自營商", "https://www.twse.com.tw/rwd/zh/fund/TWT43U?date={}&response=json"),
-    ]:
-        data, _, err = fetch_twse_rwd(url_tmpl, trade_date)
+    ]
+    MAX_RANK_RETRY  = 6    # 最多重試 6 次
+    RANK_RETRY_SECS = 300  # 每次等 5 分鐘
+
+    for label, url_tmpl in RANK_SOURCES:
+        data, actual_rank_date, err = None, None, ""
+
+        # 第一輪：嚴格要求今日資料
+        for attempt in range(MAX_RANK_RETRY):
+            data, actual_rank_date, err = fetch_twse_rwd(url_tmpl, trade_date, strict_date=True)
+            if data:
+                break
+            if attempt < MAX_RANK_RETRY - 1:
+                logging.info(f"{label}排行今日資料尚未發布，{RANK_RETRY_SECS//60} 分鐘後重試 ({attempt+1}/{MAX_RANK_RETRY})")
+                time.sleep(RANK_RETRY_SECS)
+
+        # 若今日資料始終抓不到，fallback 抓最近一個交易日
+        if not data:
+            logging.warning(f"{label}排行今日資料重試 {MAX_RANK_RETRY} 次仍無法取得，改用最近交易日資料")
+            data, actual_rank_date, err = fetch_twse_rwd(url_tmpl, trade_date, strict_date=False)
+
         if data:
             try:
                 s = parse_ranking(data, '買賣超')
                 if s:
-                    msgs.append(f"🔥 【{label}買超前 20 名】")
+                    date_str = actual_rank_date.strftime('%Y-%m-%d') if actual_rank_date else '?'
+                    # 若資料日期與三大法人金額日期不同，加上警示
+                    date_tag = date_str
+                    if actual_rank_date and actual_rank_date.date() != trade_date.date():
+                        date_tag = f"{date_str} ⚠️前日"
+                    msgs.append(f"🔥 【{label}買超前 20 名】({date_tag})")
                     msgs.extend(fmt_ranking(s[:20]))
                     msgs.append("-------------------------")
-                    msgs.append(f"🩸 【{label}賣超前 20 名】")
+                    msgs.append(f"🩸 【{label}賣超前 20 名】({date_tag})")
                     msgs.extend(fmt_ranking(list(reversed(s[-20:]))))
                     msgs.append("-------------------------")
             except Exception as e:
